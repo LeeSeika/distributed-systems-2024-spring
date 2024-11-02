@@ -19,8 +19,8 @@ package raft
 
 import (
 	//	"bytes"
+
 	"log"
-	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -105,14 +105,14 @@ type LogEntry struct {
 	Index   int
 	Command interface{}
 
-	ReplyCh  chan AppendEntriesResult
-	StopCh   chan struct{}
-	CommitCh chan bool
+	ReplyCh  chan AppendEntriesResult // a channel to collect followers' replies
+	StopCh   chan struct{}            // a channel to stop waiting for replies
+	CommitCh chan bool                // a channel to send commit signal to client
 }
 
 type appendEntriesRPCSender struct {
-	peerId            int
-	notificationCh    chan struct{}
+	peerId            int           // peer id of this sender goroutine to send AppendEntries RPC
+	notificationCh    chan struct{} // a channel to notify the sender client had sent new command
 	identityChangedCh chan machineIdentity
 }
 
@@ -141,7 +141,7 @@ type Raft struct {
 	matchIndex                 []int                     // for each server, index of highest log entry known to be replicated on server
 	applyCh                    chan ApplyMsg             // channel to send ApplyMsg to client
 	processedIndex             int                       // index of highest log entry that has been sent to followers
-	clientCh                   chan interface{}          // channel to send log entries to main loop
+	clientCh                   chan *LogEntry            // channel to send log entries to main loop
 	appendEntriesRPCSenders    []*appendEntriesRPCSender // senders for appendEntries RPC
 	heartbeatIndex             int                       // index of next heartbeat to send
 	receiveReplyNotificationCh chan struct{}             // channel to notify receive reply from followers
@@ -239,8 +239,21 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				// send heartbeat
 				rf.mu.Lock()
 
+				// check if need to send lagging logs
+				nextIndex := rf.nextIndex[sender.peerId]
+				if nextIndex <= rf.processedIndex {
+					// reset timer
+					senderTk.Reset(time.Until(rf.nextWakeUp))
+
+					rf.mu.Unlock()
+
+					// notify myself to send entries
+					sender.notificationCh <- struct{}{}
+
+					continue
+				}
+
 				// construct args and reply
-				// todo: 检查是否需要发送落后的entries
 				var args = AppendEntriesArgs{
 					Term:           rf.currTerm,
 					LeaderId:       rf.me,
@@ -255,9 +268,10 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				rf.mu.Unlock()
 
 				// send AppendEntries RPC
-				log.Println("Leader ", rf.me, " prepares to send AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " args.term: ", args.Term)
+				log.Println("Leader ", rf.me, " prepares to send AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " args.term: ", args.Term, "now: ", time.Now())
+				// log.Println("Leader ", rf.me, " prepares to send AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " args.term: ", args.Term)
 				ok := rf.peers[sender.peerId].Call("Raft.AppendEntries", &args, &reply)
-				log.Println("Leader ", rf.me, " sent AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " leader term: ", args.Term, " network ok: ", ok, " follower term: ", reply.Term, " success: ", reply.Success)
+				// log.Println("Leader ", rf.me, " sent AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " leader term: ", args.Term, " network ok: ", ok, " follower term: ", reply.Term, " success: ", reply.Success)
 
 				if !ok {
 					// network failure, retry after a short pause
@@ -287,7 +301,7 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 
 				// get prevLogIndex of this follower
 				var prevLogIndex int
-				prevLogIndex = rf.nextIndex[sender.peerId] - 1
+				prevLogIndex = rf.log[rf.nextIndex[sender.peerId]-1].Index
 
 				// get prevLogTerm of this follower
 				var prevLogTerm int
@@ -296,6 +310,12 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				// get nextIndex
 				var nextIndex int
 				nextIndex = rf.nextIndex[sender.peerId]
+
+				// check if really need to send log
+				if nextIndex > currProcessedIndex {
+					rf.mu.Unlock()
+					continue
+				}
 
 				// get entries to send
 				var entries []*LogEntry
@@ -316,6 +336,7 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				rf.mu.Unlock()
 
 				// send AppendEntries RPC
+				log.Println("Leader ", rf.me, " prepares to send AppendEntries RPC entries: ", entries, " to follower: ", sender.peerId, " args.term: ", args.Term)
 				ok := rf.peers[sender.peerId].Call("Raft.AppendEntries", &args, &reply)
 
 				if !ok {
@@ -340,6 +361,7 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				}
 				// don't need to retry, just reset timer
 				senderTk.Reset(time.Until(rf.nextWakeUp))
+				log.Println("leader ", rf.me, " is going to sleep util next wake up time: ", rf.nextWakeUp, "now: ", time.Now())
 			}
 		}
 	}
@@ -573,12 +595,13 @@ func (rf *Raft) followerLoop() {
 			rf.meIdentity = candidate
 			rf.mu.Unlock()
 
-			log.Printf("Server %d timeout, change to candidate\n", rf.me)
+			log.Println("Server ", rf.me, "timeout, change to candidate, now:", time.Now())
 			close(identityChangedCh)
 
 			return
 
 		case <-receivedHeartbeatCh:
+			log.Println("follower ", rf.me, " received heartbeat from leader, now: ", time.Now())
 			followerTk.Reset(getNextFollowerTimeout())
 		}
 	}
@@ -628,32 +651,24 @@ func (rf *Raft) leaderLoop() {
 				// update heartbeat index
 				rf.heartbeatIndex++
 
-			case command := <-rf.clientCh:
+			case logEntry := <-rf.clientCh:
 				rf.mu.Lock()
-				// append log entry to log
-				logEntry := LogEntry{
-					Term:    rf.currTerm,
-					Index:   rf.commitIndex + 1,
-					Command: command,
-
-					ReplyCh:  make(chan AppendEntriesResult),
-					StopCh:   make(chan struct{}),
-					CommitCh: make(chan bool),
-				}
-
-				rf.log = append(rf.log, &logEntry)
 				rf.processedIndex++
 
 				// notify all AppendEntries RPC senders
 				for _, sender := range rf.appendEntriesRPCSenders {
-					sender.notificationCh <- struct{}{}
+					select {
+					// don' t block the main loop
+					case sender.notificationCh <- struct{}{}:
+					default:
+					}
 				}
 
 				rf.mu.Unlock()
 
 				// wait for replies
 				// no need to start a new goroutine here, as the senders are not blocked
-				rf.waitForAppendEntriesReply(identityChangedCh, &logEntry)
+				rf.waitForAppendEntriesReply(identityChangedCh, logEntry)
 
 			}
 		}
@@ -665,7 +680,7 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 	replyCh := logEntry.ReplyCh
 	stopCh := logEntry.StopCh
 
-	currSuccessReplyCount := 0
+	currSuccessReplyCount := 1
 	currFailReplyRejectedCount := 0
 
 	// if timeout, will change identity to follower
@@ -697,10 +712,6 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 					currSuccessReplyCount++
 					// received more than half of the success replies
 					if currSuccessReplyCount > len(rf.peers)/2 {
-						rf.mu.Lock()
-						// update commitIndex
-						rf.commitIndex = logEntry.Index
-						rf.mu.Unlock()
 
 						close(stopCh)
 						commitCh <- true
@@ -711,7 +722,7 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 				case appendEntriesFailRejected:
 					currFailReplyRejectedCount++
 					// received more than half of the rejected replies
-					if currFailReplyRejectedCount > len(rf.peers)/2 {
+					if currFailReplyRejectedCount > (len(rf.peers)-1)/2 {
 						// don't change identity here, identity change from leader to follower should be done in AppendEntries RPC
 						close(stopCh)
 						commitCh <- false
@@ -724,16 +735,16 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 
 			case <-replyTicker.C:
 				// timeout
-				rf.mu.Lock()
-				// change identity to follower
-				if rf.meIdentity == leader {
-					rf.meIdentity = follower
-					close(identityChangedCh)
-				}
+				// rf.mu.Lock()
+				// // change identity to follower
+				// if rf.meIdentity == leader {
+				// 	rf.meIdentity = follower
+				close(identityChangedCh)
+				// }
 
-				rf.mu.Unlock()
+				// rf.mu.Unlock()
 
-				log.Println("Leader ", rf.me, " wait for AppendEntries reply timeout, change to follower")
+				// log.Println("Leader ", rf.me, " wait for AppendEntries reply timeout, change to follower")
 				commitCh <- false
 				close(stopCh)
 
@@ -847,7 +858,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// notify the follower loop
-	if originalIdentity == follower {
+	// rf.receivedHeartbeatCh may be nil if the follower loop is not started
+	if originalIdentity == follower && rf.receivedHeartbeatCh != nil {
 		rf.receivedHeartbeatCh <- struct{}{}
 	}
 
@@ -899,13 +911,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// append new log entries
 	rf.log = append(rf.log, newEntries...)
-	// update commit index
-	rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.log[len(rf.log)-1].Index)))
+	// update commit index ( follower's commit index should be less than leader's commit index)
+	// rf.commitIndex = int(math.Min(float64(args.LeaderCommit)+1, float64(rf.log[len(rf.log)-1].Index)))
+	rf.commitIndex = rf.log[len(rf.log)-1].Index
 
-	// apply (todo: 是不是没有apply被覆盖的log)
+	// apply
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		msg := ApplyMsg{
-			CommandValid: true,
+			CommandValid: true, // true just means this log is a new one
 			Command:      rf.getLog(i).Command,
 			CommandIndex: rf.getLog(i).Index,
 		}
@@ -915,6 +928,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// update lastApplied
 	rf.lastApplied = rf.commitIndex
 
+	log.Println("follower ", rf.me, "accepted log, log index: ", args.Entries[len(args.Entries)-1].Index, ", commitIndex: ", rf.commitIndex, " lastApplied: ", rf.lastApplied)
 }
 
 func (rf *Raft) getLog(index int) *LogEntry {
@@ -1053,13 +1067,94 @@ type RequestVoteReply struct {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
+	rf.mu.Lock()
 
-	return index, term, isLeader
+	if rf.meIdentity != leader {
+		rf.mu.Unlock()
+		return -1, -1, false
+	}
+
+	index := rf.log[len(rf.log)-1].Index + 1
+	term := rf.currTerm
+	replyCh := make(chan AppendEntriesResult, 1)
+	stopCh := make(chan struct{})
+	commitCh := make(chan bool, 1)
+
+	logEntry := LogEntry{
+		Term:    term,
+		Index:   index,
+		Command: command,
+
+		ReplyCh:  replyCh,
+		StopCh:   stopCh,
+		CommitCh: commitCh,
+	}
+
+	// append to log
+	rf.log = append(rf.log, &logEntry)
+
+	// notify leader loop
+	rf.clientCh <- &logEntry
+
+	rf.mu.Unlock()
+
+	// wait for commit result
+	commitSuccess := <-commitCh
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if !commitSuccess {
+		// fix processedIndex
+		rf.processedIndex--
+
+		// fix nextIndex and matchIndex
+		for i := 0; i < len(rf.peers); i++ {
+			if rf.me == i {
+				continue
+			}
+			// some servers may have already received the log entry, fix their nextIndex and matchIndex
+			if rf.nextIndex[i] > index {
+				rf.nextIndex[i] = index
+			}
+			if rf.matchIndex[i] >= index {
+				rf.matchIndex[i] = index - 1
+			}
+		}
+
+		// fix index to be deleted
+		indexToBeDeleted := index
+		for indexToBeDeleted >= len(rf.log) {
+			indexToBeDeleted--
+		}
+		for rf.log[indexToBeDeleted].Command != command {
+			indexToBeDeleted--
+		}
+
+		// fix leader's log
+		// delete the failed log
+		rf.log = append(rf.log[:indexToBeDeleted], rf.log[indexToBeDeleted+1:]...)
+
+		// fix the following logs' index, cause logs'index must be continuous
+		followingIndex := indexToBeDeleted
+		for i := followingIndex; i < len(rf.log); i++ {
+			rf.log[i].Index = i
+		}
+
+	} else {
+
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      command,
+			CommandIndex: logEntry.Index, // if previous logs have been deleted, logEntry.Index would be updated in fix logic, so we use logEntry.Index instead of index
+		}
+
+		rf.lastApplied = logEntry.Index
+		rf.commitIndex = rf.lastApplied
+	}
+
+	return index, term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -1113,18 +1208,24 @@ func (rf *Raft) ticker() {
 func (rf *Raft) initLoop() {
 	switch rf.meIdentity {
 	case leader:
-		rf.clientCh = make(chan interface{})
+		rf.clientCh = make(chan *LogEntry)
 		identityChangedCh := make(chan machineIdentity)
 		rf.identityChangedCh = identityChangedCh
 		rf.receivedHeartbeatCh = nil
 		rf.heartbeatIndex = 1
 		rf.receiveReplyNotificationCh = make(chan struct{}, len(rf.peers))
 
+		rf.processedIndex = rf.lastApplied
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIndex[i] = rf.commitIndex + 1
+			rf.matchIndex[i] = rf.commitIndex
+		}
+
 		rf.appendEntriesRPCSenders = make([]*appendEntriesRPCSender, len(rf.peers))
 		for i := 0; i < len(rf.peers); i++ {
 			rf.appendEntriesRPCSenders[i] = &appendEntriesRPCSender{
 				peerId:            i,
-				notificationCh:    make(chan struct{}),
+				notificationCh:    make(chan struct{}, 3),
 				identityChangedCh: identityChangedCh,
 			}
 		}
