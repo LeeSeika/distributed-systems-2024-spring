@@ -381,6 +381,16 @@ func (rf *Raft) handleAppendEntriesReply(sender *appendEntriesRPCSender, lastLog
 		nextIndex := lastLogEntry.Index + 1
 		matchIndex := lastLogEntry.Index
 
+		// fixed because of TestFailAgree3B
+		if lastLogEntry.StopCh == nil || lastLogEntry.ReplyCh == nil {
+			// the log entry was handled by other leader from previous term, so the channels are nil
+			// just update nextIndex and matchIndex
+			rf.nextIndex[sender.peerId] = nextIndex
+			rf.matchIndex[sender.peerId] = matchIndex
+
+			return false
+		}
+
 		// check if need to reply to main loop
 		select {
 		case _, ok := <-lastLogEntry.StopCh:
