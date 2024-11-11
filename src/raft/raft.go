@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 
 	"log"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -248,8 +249,9 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 					rf.mu.Unlock()
 
 					// notify myself to send entries
-					sender.notificationCh <- struct{}{}
-
+					log.Println("before stuck, leader: ", rf.me, "follower:", sender.peerId)
+					trySendChannel(sender.notificationCh)
+					log.Println("after stuck, leader: ", rf.me, "follower:", sender.peerId)
 					continue
 				}
 
@@ -268,13 +270,14 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				rf.mu.Unlock()
 
 				// send AppendEntries RPC
-				log.Println("Leader ", rf.me, " prepares to send AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " args.term: ", args.Term, "now: ", time.Now())
+				log.Println("Leader ", rf.me, " prepares to send AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " args.term: ", args.Term, "args.leaderCommit: ", args.LeaderCommit, "now: ", time.Now())
 				// log.Println("Leader ", rf.me, " prepares to send AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " args.term: ", args.Term)
 				ok := rf.peers[sender.peerId].Call("Raft.AppendEntries", &args, &reply)
 				// log.Println("Leader ", rf.me, " sent AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " leader term: ", args.Term, " network ok: ", ok, " follower term: ", reply.Term, " success: ", reply.Success)
 
 				if !ok {
 					// network failure, retry after a short pause
+					log.Println("Leader ", rf.me, " failed to send AppendEntries RPC heartbeat: ", args.HeartbeatIndex, " to follower: ", sender.peerId, " args.term: ", args.Term, " retry after a short pause")
 					senderTk.Reset(getRetryTimeout())
 					continue
 				}
@@ -311,6 +314,8 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				var nextIndex int
 				nextIndex = rf.nextIndex[sender.peerId]
 
+				log.Println("Leader ", rf.me, " decides if really need to send AppendEntries RPC entries to follower: ", sender.peerId, " currProcessedIndex: ", currProcessedIndex, " nextIndex: ", nextIndex, " prevLogIndex: ", prevLogIndex, " prevLogTerm: ", prevLogTerm)
+
 				// check if really need to send log
 				if nextIndex > currProcessedIndex {
 					rf.mu.Unlock()
@@ -341,6 +346,7 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 
 				if !ok {
 					// network failure, retry after a short pause
+					log.Println("Leader ", rf.me, " failed to send AppendEntries RPC entries: ", entries, " to follower: ", sender.peerId, " args.term: ", args.Term, " retry after a short pause")
 					senderTk.Reset(getRetryTimeout())
 					continue
 				}
@@ -667,11 +673,8 @@ func (rf *Raft) leaderLoop() {
 
 				// notify all AppendEntries RPC senders
 				for _, sender := range rf.appendEntriesRPCSenders {
-					select {
 					// don' t block the main loop
-					case sender.notificationCh <- struct{}{}:
-					default:
-					}
+					trySendChannel(sender.notificationCh)
 				}
 
 				rf.mu.Unlock()
@@ -796,11 +799,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term > rf.currTerm {
 		rf.currTerm = args.Term
-		rf.votedFor = -1
-		if rf.meIdentity == leader || rf.meIdentity == candidate {
-			rf.meIdentity = follower
-			close(rf.identityChangedCh)
-		}
+		rf.votedFor = -1 // this is a first-meet new term, reset votedFor
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -814,6 +813,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 
 			reply.VoteGranted = true
+
+			// change identity to follower
+			if rf.meIdentity == leader || rf.meIdentity == candidate {
+				rf.meIdentity = follower
+				close(rf.identityChangedCh)
+			}
+
 			return
 		}
 	}
@@ -894,8 +900,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currTerm
 	reply.Success = true
 
+	// update commit index
+	// fixed by TestFailNoAgree3B, follower's commit index should be less than or equals to leader's commit index, can update self commit index from heartbeat, so that can apply the received-but-uncommitted log from heartbeat
+	rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.log[len(rf.log)-1].Index)))
+	// rf.commitIndex = rf.log[len(rf.log)-1].Index
+
 	// heartbeat
 	if args.Entries == nil {
+		// apply
+		// fixed by TestFailAgree3B,TestFailNoAgree3B, follower always applies a log after leader had applied it
+		rf.applyLog(rf.commitIndex)
 		return
 	}
 
@@ -921,12 +935,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// append new log entries
 	rf.log = append(rf.log, newEntries...)
-	// update commit index ( follower's commit index should be less than leader's commit index)
-	// rf.commitIndex = int(math.Min(float64(args.LeaderCommit)+1, float64(rf.log[len(rf.log)-1].Index)))
-	rf.commitIndex = rf.log[len(rf.log)-1].Index
 
 	// apply
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+	rf.applyLog(rf.commitIndex)
+
+	log.Println("follower ", rf.me, "accepted log, log index: ", args.Entries[len(args.Entries)-1].Index, ", commitIndex: ", rf.commitIndex, " lastApplied: ", rf.lastApplied)
+}
+
+func (rf *Raft) applyLog(commitIndex int) {
+	for i := rf.lastApplied + 1; i <= commitIndex; i++ {
 		msg := ApplyMsg{
 			CommandValid: true, // true just means this log is a new one
 			Command:      rf.getLog(i).Command,
@@ -934,11 +951,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.applyCh <- msg
 	}
-
+	// just for logging
+	if rf.lastApplied != commitIndex {
+		log.Println("follower ", rf.me, "accepted log from heartbeat, new rf.lastApplied: ", commitIndex)
+	}
 	// update lastApplied
-	rf.lastApplied = rf.commitIndex
+	rf.lastApplied = commitIndex
 
-	log.Println("follower ", rf.me, "accepted log, log index: ", args.Entries[len(args.Entries)-1].Index, ", commitIndex: ", rf.commitIndex, " lastApplied: ", rf.lastApplied)
 }
 
 func (rf *Raft) getLog(index int) *LogEntry {
@@ -947,6 +966,14 @@ func (rf *Raft) getLog(index int) *LogEntry {
 
 func (rf *Raft) setLog(index int, entry *LogEntry) {
 	rf.log[index] = entry
+}
+
+// fixed by TestFailAgree3B, notification channel is just for notifying, so don't make the channel blocked
+func trySendChannel(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 }
 
 // return currentTerm and whether this server
@@ -1106,11 +1133,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// notify leader loop
 	rf.clientCh <- &logEntry
+	log.Println("Leader ", rf.me, " received client command: ", command, " index: ", index)
 
 	rf.mu.Unlock()
 
 	// wait for commit result
 	commitSuccess := <-commitCh
+	log.Println("Leader ", rf.me, " received commit result: ", command, " index: ", index, " commit success: ", commitSuccess)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
