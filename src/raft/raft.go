@@ -108,13 +108,20 @@ type LogEntry struct {
 
 	ReplyCh  chan AppendEntriesResult // a channel to collect followers' replies
 	StopCh   chan struct{}            // a channel to stop waiting for replies
-	CommitCh chan bool                // a channel to send commit signal to client
+	CommitCh chan commitMessage       // a channel to send commit signal to client
 }
 
 type appendEntriesRPCSender struct {
 	peerId            int           // peer id of this sender goroutine to send AppendEntries RPC
 	notificationCh    chan struct{} // a channel to notify the sender client had sent new command
 	identityChangedCh chan machineIdentity
+}
+
+type commitMessage struct {
+	success bool
+
+	// wg for waiting for the entries fixing
+	wg *sync.WaitGroup
 }
 
 // A Go object implementing a single Raft peer.
@@ -249,9 +256,7 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 					rf.mu.Unlock()
 
 					// notify myself to send entries
-					log.Println("before stuck, leader: ", rf.me, "follower:", sender.peerId)
 					trySendChannel(sender.notificationCh)
-					log.Println("after stuck, leader: ", rf.me, "follower:", sender.peerId)
 					continue
 				}
 
@@ -314,13 +319,13 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 				var nextIndex int
 				nextIndex = rf.nextIndex[sender.peerId]
 
-				log.Println("Leader ", rf.me, " decides if really need to send AppendEntries RPC entries to follower: ", sender.peerId, " currProcessedIndex: ", currProcessedIndex, " nextIndex: ", nextIndex, " prevLogIndex: ", prevLogIndex, " prevLogTerm: ", prevLogTerm)
-
 				// check if really need to send log
 				if nextIndex > currProcessedIndex {
 					rf.mu.Unlock()
 					continue
 				}
+
+				log.Println("Leader ", rf.me, " decides if really need to send AppendEntries RPC entries to follower: ", sender.peerId, " currProcessedIndex: ", currProcessedIndex, " nextIndex: ", nextIndex, " prevLogIndex: ", prevLogIndex, " prevLogTerm: ", prevLogTerm)
 
 				// get entries to send
 				var entries []*LogEntry
@@ -387,7 +392,7 @@ func (rf *Raft) handleAppendEntriesReply(sender *appendEntriesRPCSender, lastLog
 		nextIndex := lastLogEntry.Index + 1
 		matchIndex := lastLogEntry.Index
 
-		// fixed because of TestFailAgree3B
+		// fixed by TestFailAgree3B
 		if lastLogEntry.StopCh == nil || lastLogEntry.ReplyCh == nil {
 			// the log entry was handled by other leader from previous term, so the channels are nil
 			// just update nextIndex and matchIndex
@@ -420,6 +425,7 @@ func (rf *Raft) handleAppendEntriesReply(sender *appendEntriesRPCSender, lastLog
 
 		default:
 			// stopCh is still open, main loop is still waiting for reply
+			log.Println("430: going to send success to main loop, log index: ", lastLogEntry.Index, "log command: ", lastLogEntry.Command)
 			lastLogEntry.ReplyCh <- appendEntriesSuccess
 			// update nextIndex and matchIndex
 			rf.nextIndex[sender.peerId] = nextIndex
@@ -700,6 +706,10 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 	replyTicker := time.NewTicker(getNextWaitForReplyTimeout())
 	defer replyTicker.Stop()
 
+	log.Println("Leader ", rf.me, " start waiting for AppendEntries reply, log index: ", logEntry.Index, "log command: ", logEntry.Command)
+
+	wg := &sync.WaitGroup{}
+
 	// CollectLogReply:
 	for {
 		select {
@@ -707,7 +717,16 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 		case <-identityChangedCh:
 			// identity changed
 			close(stopCh)
-			commitCh <- false
+
+			commitMessage := commitMessage{
+				success: false,
+				wg:      wg,
+			}
+			wg.Add(1)
+
+			commitCh <- commitMessage
+
+			wg.Wait()
 			return
 
 		default:
@@ -716,7 +735,15 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 			case <-identityChangedCh:
 				// identity changed
 				close(stopCh)
-				commitCh <- false
+				commitMessage := commitMessage{
+					success: false,
+					wg:      wg,
+				}
+				wg.Add(1)
+
+				commitCh <- commitMessage
+
+				wg.Wait()
 				return
 
 			case replyResult := <-replyCh:
@@ -727,8 +754,17 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 					if currSuccessReplyCount > len(rf.peers)/2 {
 
 						close(stopCh)
-						commitCh <- true
+						log.Println("closed stop channel, log index: ", logEntry.Index, "log command: ", logEntry.Command)
 
+						commitMessage := commitMessage{
+							success: true,
+							wg:      wg,
+						}
+						wg.Add(1)
+
+						commitCh <- commitMessage
+
+						wg.Wait()
 						return
 					}
 
@@ -738,7 +774,16 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 					if currFailReplyRejectedCount > (len(rf.peers)-1)/2 {
 						// don't change identity here, identity change from leader to follower should be done in AppendEntries RPC
 						close(stopCh)
-						commitCh <- false
+
+						commitMessage := commitMessage{
+							success: false,
+							wg:      wg,
+						}
+						wg.Add(1)
+
+						commitCh <- commitMessage
+
+						wg.Wait()
 						return
 					}
 
@@ -758,9 +803,17 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 				// rf.mu.Unlock()
 
 				// log.Println("Leader ", rf.me, " wait for AppendEntries reply timeout, change to follower")
-				commitCh <- false
 				close(stopCh)
 
+				commitMessage := commitMessage{
+					success: false,
+					wg:      wg,
+				}
+				wg.Add(1)
+
+				commitCh <- commitMessage
+
+				wg.Wait()
 				return
 			}
 		}
@@ -1116,7 +1169,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currTerm
 	replyCh := make(chan AppendEntriesResult, 1)
 	stopCh := make(chan struct{})
-	commitCh := make(chan bool, 1)
+	commitCh := make(chan commitMessage, 1)
 
 	logEntry := LogEntry{
 		Term:    term,
@@ -1138,7 +1191,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Unlock()
 
 	// wait for commit result
-	commitSuccess := <-commitCh
+	commitMessage := <-commitCh
+	commitSuccess := commitMessage.success
 	log.Println("Leader ", rf.me, " received commit result: ", command, " index: ", index, " commit success: ", commitSuccess)
 
 	rf.mu.Lock()
@@ -1192,6 +1246,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.lastApplied = logEntry.Index
 		rf.commitIndex = rf.lastApplied
 	}
+
+	// fixed by TestConcurrentStarts3B, must wait for last log entry to be applied before process next log entry ( rf.processedIndex++ must be done after the last log entry is applied )
+	// notify leader loop to continue
+	commitMessage.wg.Done()
 
 	return index, term, true
 }
@@ -1247,7 +1305,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) initLoop() {
 	switch rf.meIdentity {
 	case leader:
-		rf.clientCh = make(chan *LogEntry)
+		rf.clientCh = make(chan *LogEntry, 10)
 		identityChangedCh := make(chan machineIdentity)
 		rf.identityChangedCh = identityChangedCh
 		rf.receivedHeartbeatCh = nil
