@@ -38,7 +38,7 @@ type machineIdentity int
 type AppendEntriesResult int
 type appendEntriesRejectedReason int
 
-const earlyWakeUp time.Duration = 1 * time.Millisecond
+const earlyWakeUp time.Duration = 3 * time.Millisecond
 
 const (
 	follower machineIdentity = iota
@@ -179,10 +179,24 @@ func getNextWaitForReplyTimeout() time.Duration {
 	return (time.Duration(ms) * time.Millisecond)
 }
 
-func getNextElectionTimeout() time.Duration {
-	// pause for a random amount of time between 150 and 300
+func getNextAppendEntriesTimeout() time.Duration {
+	// pause for a random amount of time between 50 and 100
 	// milliseconds.
-	ms := 150 + (rand.Int63() % 150)
+	ms := 50 + (rand.Int63() % 50)
+	return (time.Duration(ms) * time.Millisecond)
+}
+
+func getNextElectionTimeout() time.Duration {
+	// pause for a random amount of time between 300 and 450
+	// milliseconds.
+	ms := 300 + (rand.Int63() % 150)
+	return (time.Duration(ms) * time.Millisecond)
+}
+
+func getNextVoteRequestTimeout() time.Duration {
+	// pause for a amount of time 50
+	// milliseconds.
+	ms := 50
 	return (time.Duration(ms) * time.Millisecond)
 }
 
@@ -525,7 +539,7 @@ func (rf *Raft) candidateLoop() {
 		if i == rf.me {
 			continue
 		}
-		go rf.sendRequestVote(i, &args, &RequestVoteReply{}, voteCollectCh, stopCh)
+		go rf.sendRequestVote(i, &args, &RequestVoteReply{}, identityChangedCh, voteCollectCh, stopCh)
 	}
 
 	candidateTk := time.NewTicker(getNextElectionTimeout())
@@ -703,7 +717,7 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 	currFailReplyRejectedCount := 0
 
 	// if timeout, will change identity to follower
-	replyTicker := time.NewTicker(getNextWaitForReplyTimeout())
+	replyTicker := time.NewTicker(getNextAppendEntriesTimeout())
 	defer replyTicker.Stop()
 
 	log.Println("Leader ", rf.me, " start waiting for AppendEntries reply, log index: ", logEntry.Index, "log command: ", logEntry.Command)
@@ -797,7 +811,7 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 				// // change identity to follower
 				// if rf.meIdentity == leader {
 				// 	rf.meIdentity = follower
-				close(identityChangedCh)
+				// close(identityChangedCh)
 				// }
 
 				// rf.mu.Unlock()
@@ -820,8 +834,30 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 	}
 }
 
-func (rf *Raft) sendRequestVote(peerId int, args *RequestVoteArgs, reply *RequestVoteReply, voteCollectCh chan RequestVoteReply, stopCh chan struct{}) {
-	ok := rf.peers[peerId].Call("Raft.RequestVote", args, reply)
+func (rf *Raft) sendRequestVote(peerId int, args *RequestVoteArgs, reply *RequestVoteReply, identityChangedCh chan machineIdentity, voteCollectCh chan RequestVoteReply, stopCh chan struct{}) {
+
+	ticker := time.NewTicker(getNextVoteRequestTimeout())
+	defer ticker.Stop()
+
+	voteResultCh := make(chan bool, 1)
+	ok := false
+
+	go func() {
+		ok = rf.peers[peerId].Call("Raft.RequestVote", args, reply)
+		voteResultCh <- ok
+	}()
+
+	select {
+	case <-ticker.C:
+		// timeout
+		ok = false
+
+	case <-identityChangedCh:
+		// identity changed
+		return
+
+	case ok = <-voteResultCh:
+	}
 
 	reply.OK = ok
 
