@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"log"
 	"math"
 	"math/rand"
@@ -29,6 +30,7 @@ import (
 
 	//	"6.5840/labgob"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -440,7 +442,11 @@ func (rf *Raft) handleAppendEntriesReply(sender *appendEntriesRPCSender, lastLog
 		default:
 			// stopCh is still open, main loop is still waiting for reply
 			log.Println("430: going to send success to main loop, log index: ", lastLogEntry.Index, "log command: ", lastLogEntry.Command)
-			lastLogEntry.ReplyCh <- appendEntriesSuccess
+			ticker := time.NewTicker(getNextWaitForReplyTimeout())
+			select {
+			case lastLogEntry.ReplyCh <- appendEntriesSuccess:
+			case <-ticker.C:
+			}
 			// update nextIndex and matchIndex
 			rf.nextIndex[sender.peerId] = nextIndex
 			rf.matchIndex[sender.peerId] = matchIndex
@@ -921,6 +927,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	originalIdentity := rf.meIdentity
 
@@ -1090,12 +1097,14 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currTerm)
+	e.Encode(rf.votedFor)
+	log := rf.log[:rf.commitIndex+1]
+	e.Encode(log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -1105,17 +1114,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currTerm int
+	var votedFor int
+	var log []*LogEntry
+	if d.Decode(&currTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("decode error")
+	} else {
+		rf.currTerm = currTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -1281,6 +1293,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		rf.lastApplied = logEntry.Index
 		rf.commitIndex = rf.lastApplied
+		rf.persist()
 	}
 
 	// fixed by TestConcurrentStarts3B, must wait for last log entry to be applied before process next log entry ( rf.processedIndex++ must be done after the last log entry is applied )
@@ -1400,17 +1413,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currTerm = 0
 	rf.votedFor = -1
 	rf.log = []*LogEntry{{Term: 0, Index: 0}}
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+	rf.commitIndex = rf.log[len(rf.log)-1].Index
+	rf.lastApplied = rf.commitIndex
 	// rf.nextWakeUp = time.Now().Add(getNextFollowerTimeout())
 	rf.identityChangedCh = make(chan machineIdentity)
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.applyCh = applyCh
 	rf.processedIndex = 0
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
