@@ -337,6 +337,7 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 
 				// check if really need to send log
 				if nextIndex > currProcessedIndex {
+					log.Println("Leader ", rf.me, " decides not to send AppendEntries RPC entries to follower: ", sender.peerId, " currProcessedIndex: ", currProcessedIndex, " nextIndex: ", nextIndex, " prevLogIndex: ", prevLogIndex, " prevLogTerm: ", prevLogTerm)
 					rf.mu.Unlock()
 					continue
 				}
@@ -412,6 +413,7 @@ func (rf *Raft) handleAppendEntriesReply(sender *appendEntriesRPCSender, lastLog
 		if lastLogEntry.StopCh == nil || lastLogEntry.ReplyCh == nil {
 			// the log entry was handled by other leader from previous term, so the channels are nil
 			// just update nextIndex and matchIndex
+			log.Println("the log entry was handled by other leader from previous term, so the channels are nil, log index: ", lastLogEntry.Index, "log command: ", lastLogEntry.Command)
 			rf.nextIndex[sender.peerId] = nextIndex
 			rf.matchIndex[sender.peerId] = matchIndex
 
@@ -427,11 +429,13 @@ func (rf *Raft) handleAppendEntriesReply(sender *appendEntriesRPCSender, lastLog
 				if lastLogEntry.Index > rf.commitIndex {
 					// not committed, failed
 					// only update the committed index range
+					log.Println("last log entry greater than commit index, log index: ", lastLogEntry.Index, "log command: ", lastLogEntry.Command, "commit index: ", rf.commitIndex)
 					rf.nextIndex[sender.peerId] = nextIndex - 1
 					rf.matchIndex[sender.peerId] = matchIndex - 1
 				} else {
 					// committed, success
 					// update nextIndex and matchIndex
+					log.Println("last log entry less than or equal to commit index, log index: ", lastLogEntry.Index, "log command: ", lastLogEntry.Command, "commit index: ", rf.commitIndex)
 					rf.nextIndex[sender.peerId] = nextIndex
 					rf.matchIndex[sender.peerId] = matchIndex
 				}
@@ -695,7 +699,8 @@ func (rf *Raft) leaderLoop() {
 
 			case logEntry := <-rf.clientCh:
 				rf.mu.Lock()
-				rf.processedIndex++
+				// rf.processedIndex++
+				rf.processedIndex = logEntry.Index
 
 				// notify all AppendEntries RPC senders
 				for _, sender := range rf.appendEntriesRPCSenders {
@@ -829,6 +834,7 @@ func (rf *Raft) waitForAppendEntriesReply(identityChangedCh chan machineIdentity
 					success: false,
 					wg:      wg,
 				}
+				log.Println("commit failed because of timeout, log index: ", logEntry.Index, "log command: ", logEntry.Command)
 				wg.Add(1)
 
 				commitCh <- commitMessage
@@ -1101,8 +1107,8 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currTerm)
 	e.Encode(rf.votedFor)
-	log := rf.log[:rf.commitIndex+1]
-	e.Encode(log)
+	e.Encode(rf.log)
+	e.Encode(rf.commitIndex)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
 }
@@ -1119,14 +1125,17 @@ func (rf *Raft) readPersist(data []byte) {
 	var currTerm int
 	var votedFor int
 	var log []*LogEntry
+	var commitIndex int
 	if d.Decode(&currTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&commitIndex) != nil {
 		panic("decode error")
 	} else {
 		rf.currTerm = currTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.commitIndex = commitIndex
 	}
 }
 
@@ -1248,7 +1257,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	if !commitSuccess {
 		// fix processedIndex
-		rf.processedIndex--
+		// rf.processedIndex--
+		rf.processedIndex = rf.commitIndex
 
 		// fix nextIndex and matchIndex
 		for i := 0; i < len(rf.peers); i++ {
@@ -1285,10 +1295,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	} else {
 
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      command,
-			CommandIndex: logEntry.Index, // if previous logs have been deleted, logEntry.Index would be updated in fix logic, so we use logEntry.Index instead of index
+		// figure 8, apply the log entry which was processed by former leader
+		for i := rf.commitIndex + 1; i <= logEntry.Index; i++ {
+			_logEntry := rf.log[i]
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      _logEntry.Command,
+				CommandIndex: _logEntry.Index, // if previous logs have been deleted, logEntry.Index would be updated in fix logic, so we use logEntry.Index instead of index
+			}
 		}
 
 		rf.lastApplied = logEntry.Index
@@ -1413,9 +1427,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currTerm = 0
 	rf.votedFor = -1
 	rf.log = []*LogEntry{{Term: 0, Index: 0}}
+	rf.commitIndex = 0
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.commitIndex = rf.log[len(rf.log)-1].Index
 	rf.lastApplied = rf.commitIndex
 	// rf.nextWakeUp = time.Now().Add(getNextFollowerTimeout())
 	rf.identityChangedCh = make(chan machineIdentity)
