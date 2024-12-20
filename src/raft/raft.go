@@ -346,7 +346,8 @@ func (rf *Raft) startAppendEntriesSender(identityChangedCh chan machineIdentity,
 
 				// get entries to send
 				var entries []*LogEntry
-				entries = rf.log[nextIndex : currProcessedIndex+1]
+				// entries = rf.log[nextIndex : currProcessedIndex+1]
+				entries = rf.deepCopy(nextIndex, currProcessedIndex)
 
 				// construct args and reply
 				var args = AppendEntriesArgs{
@@ -405,6 +406,17 @@ func (rf *Raft) handleAppendEntriesReply(sender *appendEntriesRPCSender, lastLog
 			// heartbeat success, don't need to update nextIndex and matchIndex
 			return false
 		}
+
+		// check if this cmd has already failed
+		// case 1: rf.processedIndex has already rolled back
+		// case 2: a new log has been assigned the index rf.processedIndex
+		// log.Println("leader check follower ", sender.peerId, " check up processed:", rf.processedIndex, "curr lsatentriesindex cmd: ", rf.log[lastLogEntry.Index].Command, " updating next index because the cmd ", lastLogEntry.Index, ": ", lastLogEntry.Command, " has failed")
+		if rf.processedIndex < lastLogEntry.Index || rf.log[lastLogEntry.Index].Command != lastLogEntry.Command {
+			// can't update nextIndex and matchIndex
+			log.Println("leader check follower ", sender.peerId, " gave up updating next index because the cmd ", lastLogEntry.Index, ": ", lastLogEntry.Command, " has failed")
+			return false
+		}
+
 		// nextIndex and matchIndex
 		nextIndex := lastLogEntry.Index + 1
 		matchIndex := lastLogEntry.Index
@@ -1068,6 +1080,24 @@ func (rf *Raft) getLog(index int) *LogEntry {
 
 func (rf *Raft) setLog(index int, entry *LogEntry) {
 	rf.log[index] = entry
+}
+
+func (rf *Raft) deepCopy(src, dest int) []*LogEntry {
+	entries := make([]*LogEntry, 0, dest-src+1)
+	for i := src; i <= dest; i++ {
+		e := rf.log[i]
+		entries = append(entries, &LogEntry{
+			Term:    e.Term,
+			Index:   e.Index,
+			Command: e.Command,
+
+			ReplyCh:  e.ReplyCh,
+			CommitCh: e.CommitCh,
+			StopCh:   e.StopCh,
+		})
+	}
+
+	return entries
 }
 
 // fixed by TestFailAgree3B, notification channel is just for notifying, so don't make the channel blocked
